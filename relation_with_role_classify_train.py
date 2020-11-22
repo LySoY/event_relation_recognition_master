@@ -8,7 +8,7 @@ from utils.argutils import print_args
 # from pathlib import Path
 import argparse
 import json
-import glob
+from torch.autograd import Variable
 import torch.optim
 import numpy as np
 from tqdm import trange
@@ -17,8 +17,8 @@ from my_optimizers import Ranger
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 from language_model.transformers import ElectraTokenizer
-from nn.embeddings import ElectraModel
-from models.rnn_cnn_model import *
+from nn.my_embeddings import MyElectraModel
+from models.cnn_model import *
 import datetime
 
 
@@ -30,15 +30,19 @@ def set_args(filename):
                         default=20,  # 默认5
                         type=int,
                         help="训练次数大小")
+    parser.add_argument("--role_lr",
+                        default=5e-2,
+                        type=float,
+                        help="Role_Embeddings初始学习步长")
     parser.add_argument("--embeddings_lr",
                         default=5e-4,
                         type=float,
                         help="Embeddings初始学习步长")
     parser.add_argument("--encoder_lr",
-                        default=5e-4,
+                        default=5e-3,
                         type=float)
     parser.add_argument("--learning_rate",
-                        default=5e-4,
+                        default=5e-3,
                         type=float)
     parser.add_argument("--weight_decay", default=0, type=float)
     parser.add_argument("--train_batch_size",
@@ -53,20 +57,12 @@ def set_args(filename):
                         default=.0,
                         type=float,
                         help="验证集大小")
-    parser.add_argument("--train_data_filename",
-                        default='data/rel_data/test.csv',
-                        type=str,
-                        help="The input data filename. Should contain the .csv files (or other data files) for the "
-                             "task.")
-    parser.add_argument("--test_data_filename",
-                        default='data/rel_data/test.csv',
-                        type=str)
     parser.add_argument("--train_data_dir",
-                        default='data/rel_data/',
+                        default='data/RnR_data/train/',
                         type=str,
                         help="The input data dir.")
     parser.add_argument("--test_data_dir",
-                        default='data/rel_data/',
+                        default='data/RnR_data/test/',
                         type=str)
     parser.add_argument("--mymodel_config_dir",
                         default='config/relation_classify_config.json',
@@ -83,7 +79,10 @@ def set_args(filename):
                         help="The vocab data dir.")
     parser.add_argument("--rel2label",
                         default={'Causal': 0, 'Follow': 1, 'Accompany': 2, 'Concurrency': 3, 'Other': 4},
-                        type=dict)
+                        type=list)
+    parser.add_argument("--max_role_size",
+                        default=13,
+                        type=int)
     parser.add_argument("--do_train",
                         default=True,
                         action='store_true',
@@ -176,11 +175,17 @@ def rel2label(t_label, args):
     except:
         return len(args.rel2label)-1
 
+def sync(device: torch.device):
+    # FIXME
+    return
+    # For correct profiling (cuda operations are async)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 # 网络训练
 def mymodel_train(args, logger, train_dataloader, validation_dataloader):
     config = ElectraConfig.from_pretrained(args.mymodel_config_dir)
-    embedding = ElectraModel(config=config)
+    embedding = MyElectraModel(config=config)
     model = RelClassifyModel(config=config, args=args)
     # try:
     #     output_model_file = os.path.join(args.mymodel_save_dir, 'embedding/')
@@ -199,14 +204,15 @@ def mymodel_train(args, logger, train_dataloader, validation_dataloader):
         model.half()
     embedding.to(device)
     model.to(device)
+    model.set_loss_device(loss_device)
     param_optimizer1 = list(embedding.named_parameters())
     param_optimizer2 = list(model.named_parameters())
     optimizer_grouped_parameters1 = [
-        {'params': [p for n, p in param_optimizer1 if any(nd in n for nd in ['embeddings'])],
+        {'params': [p for n, p in param_optimizer1 if any(nd in n for nd in ['role_embeddings'])],
          'weight_decay_rate': args.weight_decay,
+         'lr': args.role_lr},
+        {'params': [p for n, p in param_optimizer1 if not any(nd in n for nd in ['role_embeddings'])],
          'lr': args.embeddings_lr},
-        {'params': [p for n, p in param_optimizer1 if not any(nd in n for nd in ['embeddings'])],
-         'lr': args.encoder_lr},
     ]
     optimizer_grouped_parameters2 = [
         {'params': [p for n, p in param_optimizer2 if any(nd in n for nd in ['encoder'])],
@@ -217,7 +223,7 @@ def mymodel_train(args, logger, train_dataloader, validation_dataloader):
     optimizer1 = Ranger(optimizer_grouped_parameters1)
     optimizer2 = Ranger(optimizer_grouped_parameters2)
     epochs = args.train_epochs
-    bio_records, train_loss_set, acc_records= [], [], []
+    bio_records, train_loss_set, acc_records = [], [], []
     embedding.train()
     model.train()
     for _ in trange(epochs, desc='Epochs'):
@@ -228,20 +234,20 @@ def mymodel_train(args, logger, train_dataloader, validation_dataloader):
         tmp_loss = []
         for step, batch in enumerate(train_dataloader):
             batch = tuple(t.to(device) for t in batch)
-            b_input_ids1, b_input_ids2, b_labels = batch
+            b_input_ids1, b_input_ids2, b_labels, input_role1, input_role2 = batch
+            sync(device)
             b_input_ids1 = b_input_ids1.squeeze(1).long()
             b_input_ids2 = b_input_ids2.squeeze(1).long()
-            text_embedding1 = embedding(input_ids=b_input_ids1)
-            text_embedding2 = embedding(input_ids=b_input_ids2,
-                                        token_type_ids=torch.ones(b_input_ids2.size(),
-                                                                  dtype=torch.long, device=device))
+            text_embedding1 = embedding(input_ids=b_input_ids1, role_ids=input_role1)
+            text_embedding2 = embedding(input_ids=b_input_ids2, role_ids=input_role2)
+            sync(device)
             loss, tmp_eval_accuracy = model(text_embedding1, text_embedding2, b_labels)
+            sync(loss_device)
             optimizer1.zero_grad()
             optimizer2.zero_grad()
             loss.backward()
             optimizer1.step()
             optimizer2.step()
-            torch.cuda.empty_cache()
             tr_loss += loss.item()
             nb_tr_steps += 1
             eval_accuracy += tmp_eval_accuracy
@@ -267,7 +273,7 @@ def mymodel_train(args, logger, train_dataloader, validation_dataloader):
 # 网络测试
 def mymodel_test(logger, test_dataloader, the_time=my_time):
     config = ElectraConfig.from_pretrained(args.mymodel_config_dir)
-    embedding = ElectraModel(config=config)
+    embedding = MyElectraModel(config=config)
     model = RelClassifyModel(config=config, args=args)
     output_model_file = os.path.join(args.mymodel_save_dir, 'embedding/')
     model_state_dict = torch.load(os.path.join(output_model_file, the_time+'pytorch_model.bin'))
@@ -285,15 +291,13 @@ def mymodel_test(logger, test_dataloader, the_time=my_time):
     nb_eval_steps = 0
     for step, batch in enumerate(test_dataloader):
         batch = tuple(t.to(device) for t in batch)
-        b_input_ids1, b_input_ids2, b_labels = batch
+        b_input_ids1, b_input_ids2, b_labels, input_role1, input_role2 = batch
         b_input_ids1 = b_input_ids1.squeeze(1).long()
         b_input_ids2 = b_input_ids2.squeeze(1).long()
         with torch.no_grad():
-            text_embedding1 = embedding(input_ids=b_input_ids1)
-            text_embedding2 = embedding(input_ids=b_input_ids2,
-                                        token_type_ids=torch.ones(b_input_ids2.size(),
-                                                                  dtype=torch.long, device=device))
-            tmp_eval_accuracy = model.test(text_embedding1, text_embedding2, b_labels)
+            text_embedding1 = embedding(input_ids=b_input_ids1, role_ids=input_role1)
+            text_embedding2 = embedding(input_ids=b_input_ids2, role_ids=input_role2)
+            tmp_eval_accuracy = model.test(text_embedding1, text_embedding2, b_labels, input_role1, input_role2)
         eval_accuracy += tmp_eval_accuracy
         nb_eval_steps += 1
     try:
@@ -307,7 +311,7 @@ def mymodel_test(logger, test_dataloader, the_time=my_time):
 
 def mymodel_cal(logger, test_dataloader, the_time=my_time):
     config = ElectraConfig.from_pretrained(args.mymodel_config_dir)
-    embedding = ElectraModel(config=config)
+    embedding = MyElectraModel(config=config)
     model = RelClassifyModel(config=config, args=args)
     output_model_file = os.path.join(args.mymodel_save_dir, 'embedding/')
     model_state_dict = torch.load(os.path.join(output_model_file, the_time+'pytorch_model.bin'))
@@ -326,15 +330,13 @@ def mymodel_cal(logger, test_dataloader, the_time=my_time):
     result = np.zeros([target_size, target_size])
     for step, batch in enumerate(test_dataloader):
         batch = tuple(t.to(device) for t in batch)
-        b_input_ids1, b_input_ids2, b_labels = batch
+        b_input_ids1, b_input_ids2, b_labels, input_role1, input_role2 = batch
         b_input_ids1 = b_input_ids1.squeeze(1).long()
         b_input_ids2 = b_input_ids2.squeeze(1).long()
         with torch.no_grad():
-            text_embedding1 = embedding(input_ids=b_input_ids1)
-            text_embedding2 = embedding(input_ids=b_input_ids2,
-                                        token_type_ids=torch.ones(b_input_ids2.size(),
-                                                                  dtype=torch.long, device=device))
-            pred = model.get_guess(text_embedding1, text_embedding2)
+            text_embedding1 = embedding(input_ids=b_input_ids1, role_ids=input_role1)
+            text_embedding2 = embedding(input_ids=b_input_ids2, role_ids=input_role2)
+            pred = model.get_guess(text_embedding1, text_embedding2, input_role1, input_role2)
         size = pred.size()[0]
         for i in range(size):
             try:
@@ -348,36 +350,49 @@ def mymodel_cal(logger, test_dataloader, the_time=my_time):
 # 获取数据集
 def get_dataloader(filenames):
     tokenizer = ElectraTokenizer.from_pretrained(args.vocab_dir)
-    all_train_filenames = glob.glob(filenames + "*.csv")
     input_ids1 = []
     input_ids2 = []
+    input_role1 = []
+    input_role2 = []
     labels = []
-    cnt = 0
-    Text1 = re.compile('.+\$')
-    Text2 = re.compile('\$.+@')
-    Text3 = re.compile('@.+')
-    for idx, filename in enumerate(all_train_filenames):
-        for line in read_lines(filename):
-            line = re.sub(u'\t', '', line)
-            text1 = re.sub(u'\$', '', Text1.findall(line)[0])
-            text2 = re.sub(u'@', '', re.sub(u'\$', '', Text2.findall(line)[0]))
-            t_label = re.sub(u'@', '', Text3.findall(line)[0])
-            tmp1, _, _ = text2ids(tokenizer, text1, args.max_sent_len)
-            tmp2, _, _ = text2ids(tokenizer, text2, args.max_sent_len)
-            label = rel2label(t_label, args)
-            input_ids1.append(tmp1)
-            input_ids2.append(tmp2)
-            labels.append(label)
-            cnt += 1
-    train_input1, validation_input1, train_input2, validation_input2, train_labels, validation_labels = \
-        train_test_split(input_ids1, input_ids2, labels, random_state=args.seed, test_size=args.test_size)
+    try:
+        E1 = np.load(filenames+"e1.npy")
+        E2 = np.load(filenames+"e2.npy")
+        B1 = np.load(filenames+"b1.npy")
+        B2 = np.load(filenames+"b2.npy")
+        R = np.load(filenames+"r.npy")
+    except:
+        from data.get_relation_from_xml import get_rel_and_role
+        data, _ = get_rel_and_role('data/CEC', tokenizer)
+        # _, data = get_rel_and_role('data/CEC', tokenizer)
+        E1 = data[0]
+        E2 = data[1]
+        B1 = data[2]
+        B2 = data[3]
+        R = data[4]
+    for i in range(len(E1)):
+        tmp1, _, _ = text2ids(tokenizer, E1[i], args.max_sent_len)
+        tmp2, _, _ = text2ids(tokenizer, E2[i], args.max_sent_len)
+        input_role1.append(convert_single_list(B1[i], args.max_sent_len, args.max_role_size))
+        input_role2.append(convert_single_list(B2[i], args.max_sent_len, args.max_role_size))
+        label = rel2label(R[i], args)
+        input_ids1.append(tmp1)
+        input_ids2.append(tmp2)
+        labels.append(label)
+    train_input1, validation_input1, train_input2, validation_input2, \
+        train_labels, validation_labels, input_role1, validation_input_role1,\
+        input_role2, validation_input_role2 = \
+        train_test_split(input_ids1, input_ids2, labels, input_role1, input_role2,
+                         random_state=args.seed, test_size=args.test_size)
 
     # 将训练集tensor并生成dataloader
     train_inputs1 = torch.Tensor(train_input1)
     train_inputs2 = torch.Tensor(train_input2)
     train_labels = torch.LongTensor(train_labels)
+    inputs_role1 = torch.LongTensor(input_role1)
+    inputs_role2 = torch.LongTensor(input_role2)
     batch_size = args.train_batch_size
-    train_data = TensorDataset(train_inputs1, train_inputs2, train_labels)
+    train_data = TensorDataset(train_inputs1, train_inputs2, train_labels, inputs_role1, inputs_role2)
     train_sampler = RandomSampler(train_data)
     train_dataloader = DataLoader(train_data,
                                   sampler=train_sampler,
@@ -388,7 +403,10 @@ def get_dataloader(filenames):
         validation_inputs1 = torch.Tensor(validation_input1)
         validation_inputs2 = torch.Tensor(validation_input2)
         validation_labels = torch.LongTensor(validation_labels)
-        validation_data = TensorDataset(validation_inputs1, validation_inputs2, validation_labels)
+        validation_role1 = torch.LongTensor(validation_input_role1)
+        validation_role2 = torch.LongTensor(validation_input_role2)
+        validation_data = TensorDataset(validation_inputs1, validation_inputs2, validation_labels,
+                                        validation_role1, validation_role2)
         validation_sampler = RandomSampler(validation_data)
         validation_dataloader = DataLoader(validation_data,
                                            sampler=validation_sampler,
