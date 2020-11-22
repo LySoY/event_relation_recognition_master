@@ -1,0 +1,2 @@
+# event_relation_recognition_master
+Identify relationships between event sentences
